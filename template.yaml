@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  sap-event-bridge. MOCK SAP business events flow through EventBridge to a Lambda function
+  that validates them, archives the raw event to S3, stores it in DynamoDB, and sends
+  invalid events to a dead-letter queue.
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: S3 bucket that holds the Lambda deployment package.
+  CodeKey:
+    Type: String
+    Description: Object key of the Lambda deployment package (zip of the sapbridge/ folder).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90]
+
+Resources:
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${AWS::StackName}-sap-bus"
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-rejected-events
+            Status: Enabled
+            Prefix: rejected/
+            ExpirationInDays: 90
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  # Events the Lambda could not process after its retries (transient failures).
+  # Invalid events never land here: the handler sends those to DeadLetterQueue itself.
+  DeliveryFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: pipeline-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt EventsTable.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArchiveBucket.Arn}/*"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  - !GetAtt DeadLetterQueue.Arn
+                  - !GetAtt DeliveryFailureQueue.Arn
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: sapbridge.handler.lambda_handler
+      Role: !GetAtt ProcessorRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EventsTable
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          DLQ_URL: !Ref DeadLetterQueue
+
+  ProcessorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 3600
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt DeliveryFailureQueue.Arn
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProcessorFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SapEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source:
+          - sapbridge.mock
+      Targets:
+        - Id: processor
+          Arn: !GetAtt ProcessorFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+
+  RuleInvokesProcessor:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SapEventsRule.Arn
+
+Outputs:
+  EventBusName:
+    Value: !Ref EventBus
+  TableName:
+    Value: !Ref EventsTable
+  ArchiveBucketName:
+    Value: !Ref ArchiveBucket
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  DeliveryFailureQueueUrl:
+    Value: !Ref DeliveryFailureQueue
