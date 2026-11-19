@@ -9,7 +9,7 @@ dead-letter queue. All data is synthetic.
 - [x] Deterministic mock SAP event source, including deliberately bad events
 - [x] Pipeline handler: validate, archive to S3, idempotent write to DynamoDB, dead-letter queue
 - [x] CloudFormation template, checked with cfn-lint
-- [ ] Local demo CLI on mocked AWS
+- [x] Local demo CLI on mocked AWS
 - [ ] CI, architecture, design decisions and cost drivers
 
 ```bash

@@ -14,6 +14,10 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "boto3>=1.34", "moto[dynamodb,s3,sqs]>=5", "pyyaml>=6", "cfn-lint>=1"]
+demo = ["boto3>=1.34", "moto[dynamodb,s3,sqs]>=5"]
+
+[project.scripts]
+sapbridge = "sapbridge.cli:main"
 
 [tool.setuptools]
 packages = ["sapbridge"]
